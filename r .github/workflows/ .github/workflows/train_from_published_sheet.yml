@@ -1,0 +1,58 @@
+name: Train model from published Google Sheet
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: '0 3 * * *'  # daily at 03:00 UTC (optional)
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download published Google Sheet CSV
+        run: |
+          GOOGLE_SHEET_CSV_URL="https://docs.google.com/spreadsheets/d/e/2PACX-1vRYHnOdoIYsuQ3XbKVWcbzXSVDmTbD6g6D72R5NAIqh_ct10g1mmIVYoQgTGTyM-bsVyqo70VavUXjh/pub?output=csv"
+          echo "Downloading published CSV..."
+          curl -sSL "$GOOGLE_SHEET_CSV_URL" -o surveys.csv
+          echo "Head of surveys.csv:"
+          head -n 5 surveys.csv || true
+          echo "Lines in surveys.csv:"
+          wc -l surveys.csv || true
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install pandas numpy scikit-learn joblib; fi
+
+      - name: Run training script
+        run: |
+          python train_model_from_googleform.py
+
+      - name: Upload predictions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: predictions
+          path: predictions_for_powerbi.csv
+
+      - name: Commit predictions back to repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -f predictions_for_powerbi.csv ]; then
+            git add predictions_for_powerbi.csv
+            git commit -m "Update predictions_for_powerbi.csv (GitHub Actions)" || echo "No changes to commit"
+            git push origin HEAD:$(git rev-parse --abbrev-ref HEAD) || echo "Push failed"
+          else
+            echo "predictions_for_powerbi.csv not found"
+            exit 1
+          fi
