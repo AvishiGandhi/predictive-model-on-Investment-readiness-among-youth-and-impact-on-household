@@ -1,58 +1,150 @@
-name: Train model from published Google Sheet
+#!/usr/bin/env python3
+"""
+run_pipeline.py
 
-on:
-  workflow_dispatch: {}
-  schedule:
-    - cron: '0 3 * * *'  # daily at 03:00 UTC (optional)
+Usage examples:
+  # 1) Run locally against an uploaded surveys.csv (no download):
+    python run_pipeline.py
 
-jobs:
-  train:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+  # 2) Download published Google Sheet CSV and run:
+    python run_pipeline.py --csv-url "https://docs.google.com/....pub?output=csv"
 
-      - name: Download published Google Sheet CSV
-        run: |
-          GOOGLE_SHEET_CSV_URL="https://docs.google.com/spreadsheets/d/e/2PACX-1vRYHnOdoIYsuQ3XbKVWcbzXSVDmTbD6g6D72R5NAIqh_ct10g1mmIVYoQgTGTyM-bsVyqo70VavUXjh/pub?output=csv"
-          echo "Downloading published CSV..."
-          curl -sSL "$GOOGLE_SHEET_CSV_URL" -o surveys.csv
-          echo "Head of surveys.csv:"
-          head -n 5 surveys.csv || true
-          echo "Lines in surveys.csv:"
-          wc -l surveys.csv || true
+  # 3) In CI (GitHub Actions), pass the published URL as an arg:
+    python run_pipeline.py --csv-url "$PUBLISHED_CSV_URL"
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
+  # 4) If you want the script to attempt to commit results back to the repo (CI only):
+    export GITHUB_TOKEN=ghp_...   # set by Actions automatically
+    python run_pipeline.py --csv-url "$PUBLISHED_CSV_URL" --commit
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install pandas numpy scikit-learn joblib; fi
+Notes:
+- This script uses the same modelling logic as earlier scripts you were given.
+- Dependencies: pandas, numpy, scikit-learn, joblib, requests
+  Install them with: pip install pandas numpy scikit-learn joblib requests
+"""
+import os
+import sys
+import argparse
+import math
+import subprocess
+import tempfile
+from pathlib import Path
 
-      - name: Run training script
-        run: |
-          python train_model_from_googleform.py
+import pandas as pd
+import numpy as np
+import requests
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
+import joblib
 
-      - name: Upload predictions artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: predictions
-          path: predictions_for_powerbi.csv
+# ---------------------
+# Mapping dictionaries (tune if your form text differs)
+# ---------------------
+AGE_MAP = {
+    '15 - 16': 15.5, '15-16': 15.5, '15 – 16': 15.5,
+    '17 - 18': 17.5, '17-18': 17.5, '17 – 18': 17.5,
+    '19 - 20': 19.5, '19-20': 19.5, '19 – 20': 19.5,
+    '21 - 22': 21.5, '21-22': 21.5, '21 – 22': 21.5
+}
 
-      - name: Commit predictions back to repo
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if [ -f predictions_for_powerbi.csv ]; then
-            git add predictions_for_powerbi.csv
-            git commit -m "Update predictions_for_powerbi.csv (GitHub Actions)" || echo "No changes to commit"
-            git push origin HEAD:$(git rev-parse --abbrev-ref HEAD) || echo "Push failed"
-          else
-            echo "predictions_for_powerbi.csv not found"
-            exit 1
-          fi
+INCOME_RANGE_MAP = {
+    '<5,000': 3000, '<5000': 3000,
+    '5,000 - 10,000': 7500, '5000-10000': 7500,
+    '10,000 - 15,000': 12500,
+    '15,000 - 20,000': 17500, '15000 - 20,000': 17500,
+    '>20,000': 25000, '20,000+': 25000
+}
+
+PERCENT_BAND_MAP = {
+    '<20%': 10, '<20': 10,
+    '20% - 40%': 30, '20-40': 30,
+    '40% - 60%': 50, '40-60': 50,
+    '60% - 80%': 70, '60-80': 70,
+    '80% - 100%': 90, '80-100': 90,
+    '> 20%': 30, '20%': 20
+}
+
+FAMILY_DISCUSS_MAP = {'always': 1.0, 'frequently': 0.8, 'rarely': 0.3, 'never': 0.0}
+
+INVEST_TOOLS = ['Mutual Funds','Stock Market','Fixed Deposits','Gold','PPF','NPS','Government Bonds','ETFs','Real Estate','Cryptocurrency','Other']
+
+# ---------------------
+# Helpers
+# ---------------------
+def download_csv(url: str, out_path: str):
+    print(f"Downloading CSV from: {url}")
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    content = r.content
+    Path(out_path).write_bytes(content)
+    print(f"Wrote {out_path} ({len(content)} bytes)")
+
+def find_col(df: pd.DataFrame, keywords):
+    for c in df.columns:
+        lc = c.lower()
+        for k in keywords:
+            if k in lc:
+                return c
+    return None
+
+def parse_age(v):
+    if pd.isna(v): return np.nan
+    s = str(v).strip()
+    if s in AGE_MAP:
+        return AGE_MAP[s]
+    # try numeric
+    try:
+        return float(s)
+    except:
+        return np.nan
+
+def parse_income_range(v):
+    if pd.isna(v): return np.nan
+    s = str(v).strip()
+    return INCOME_RANGE_MAP.get(s, np.nan)
+
+def parse_percent_band(v):
+    if pd.isna(v): return np.nan
+    s = str(v).strip()
+    return PERCENT_BAND_MAP.get(s, np.nan)
+
+def parse_yesno(v):
+    if pd.isna(v): return 0
+    s = str(v).strip().lower()
+    return 1 if s.startswith('y') else 0
+
+def parse_invest_where_cell(cell):
+    if pd.isna(cell) or str(cell).strip()=='':
+        return set()
+    items = [p.strip() for p in str(cell).replace(',', ';').split(';') if p.strip()]
+    return set(items)
+
+# ---------------------
+# Feature engineering & model (adapted from previous script)
+# ---------------------
+def build_features(df_raw: pd.DataFrame):
+    df_raw = df_raw.copy()
+    df_raw.columns = [c.strip() for c in df_raw.columns]
+    W = pd.DataFrame()
+    W['respondent_id'] = df_raw.index.astype(str)
+
+    col_age = find_col(df_raw, ['age'])
+    col_income_range = find_col(df_raw, ['range of income','income range','income'])
+    col_save_pct = find_col(df_raw, ['percentage of your income do you save','what percentage of your income do you save','save'])
+    col_invest_flag = find_col(df_raw, ['do you invest'])
+    col_invest_where = find_col(df_raw, ['where do you currently invest','where do you invest'])
+    col_invest_pct = find_col(df_raw, ['percentage of your income do you invest','what percentage of your income do you invest'])
+    col_family_discuss = find_col(df_raw, ['discuss money with your family','how often do you discuss money'])
+    col_family_changed = find_col(df_raw, ['family changed','changed spending'])
+    col_interest = find_col(df_raw, ['interest'])
+    col_inflation = find_col(df_raw, ['inflation'])
+
+    print("Detected columns (best-effort):")
+    for name, col in [('age',col_age),('income_range',col_income_range),('save_pct',col_save_pct),
+                      ('invest_flag',col_invest_flag),('invest_where',col_invest_where),('invest_pct',col_invest_pct),
+                      ('family_discuss',col_family_discuss),('family_changed',col_family_changed),
+                      ('interest_rate',col_interest),('inflation_rate',col_inflation)]:
+        print("
+
